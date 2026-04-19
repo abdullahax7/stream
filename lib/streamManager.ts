@@ -33,7 +33,7 @@ const processes = globalWithStreams.processes;
 /** Lazily resolve log directory */
 function getLogFilePath(): string {
   if (!globalWithStreams.logDir) {
-    const logDir = path.join(process.cwd(), 'logs');
+    const logDir = path.join(/* turbopackIgnore: true */ process.cwd(), 'logs');
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
     }
@@ -42,114 +42,8 @@ function getLogFilePath(): string {
   return path.join(globalWithStreams.logDir, 'ffmpeg-stream.log');
 }
 
-/** ✅ FIXED: Reliable FFmpeg path for VPS */
+/** Lazily locate ffmpeg binary — checks env var, known install paths, then PATH */
 function getFfmpegPath(): string {
-  if (globalWithStreams.ffmpegPath) return globalWithStreams.ffmpegPath;
-
-  // 1. Environment variable (best practice)
-  if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
-    globalWithStreams.ffmpegPath = process.env.FFMPEG_PATH;
-    console.log(`[StreamManager] Using FFmpeg from ENV: ${process.env.FFMPEG_PATH}`);
-    return globalWithStreams.ffmpegPath;
-  }
-
-  // 2. Default Linux path
-  const defaultPath = '/usr/bin/ffmpeg';
-  if (fs.existsSync(defaultPath)) {
-    globalWithStreams.ffmpegPath = defaultPath;
-    console.log(`[StreamManager] Using FFmpeg at: ${defaultPath}`);
-    return defaultPath;
-  }
-
-  // 3. Fallback to PATH
-  try {
-    const result = execSync('which ffmpeg', { encoding: 'utf-8' }).trim();
-    if (result) {
-      globalWithStreams.ffmpegPath = result;
-      console.log(`[StreamManager] Found FFmpeg via PATH: ${result}`);
-      return result;
-    }
-  } catch {
-    // ignore
-  }
-
-  // 4. Final fallback (will likely fail if not installed)
-  console.warn('[StreamManager] WARNING: FFmpeg not found!');
-  return 'ffmpeg';
-}
-
-/** Kill a process */
-function killProcess(proc: ChildProcess) {
-  if (!proc.pid) return;
-  try {
-    proc.kill('SIGINT');
-  } catch {
-    try { proc.kill(); } catch {}
-  }
-}
-
-/** Safe log writer */
-function createSafeLogWriter(filePath: string) {
-  const stream = fs.createWriteStream(filePath, { flags: 'a' });
-  let ended = false;
-  return {
-    write(msg: string) {
-      if (!ended) {
-        try { stream.write(msg); } catch {}
-      }
-    },
-    end() {
-      if (!ended) {
-        ended = true;
-        try { stream.end(); } catch {}
-      }
-    },
-  };
-}
-
-export const streamManager = {
-  getStreams: () => Array.from(activeStreams.values()),
-
-  startStream: (name: string, inputUrl: string) => {
-    const id = Math.random().toString(36).substring(7);
-    const ffmpeg = getFfmpegPath();
-    const logFilePath = getLogFilePath();
-
-    const destinationUrl = `rtmp://74.208.198.159/live/${name.replace(/\s+/g, '_')}`;
-
-    const args = [
-      '-re',
-      '-i', inputUrl,
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-tune', 'zerolatency',
-      '-c:a', 'aac',
-      '-f', 'flv',
-      destinationUrl
-    ];
-
-    console.log(`Starting ffmpeg for [${name}] → ${destinationUrl}`);
-
-    const log = createSafeLogWriter(logFilePath);
-    log.write(`\n--- Starting Stream: ${name} [${new Date().toISOString()}] ---\n`);
-    log.write(`Command: ${ffmpeg} ${args.join(' ')}\n`);
-
-    let ffmpegProcess: ChildProcess;
-
-    try {
-      ffmpegProcess = spawn(ffmpeg, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log.write(`\n--- Spawn Error: ${errMsg} ---\n`);
-      log.end();
-
-      return {
-        id,
-        name,
-        inputUrl,
-        outputUrl: destinationUrl,function getFfmpegPath(): string {
   if (globalWithStreams.ffmpegPath) return globalWithStreams.ffmpegPath;
 
   // Allow explicit override via env var (recommended for production)
@@ -225,3 +119,176 @@ export const streamManager = {
   console.warn('[StreamManager] WARNING: Could not locate ffmpeg binary!');
   return 'ffmpeg';
 }
+
+/** Recursively search for a file up to maxDepth */
+function findFileRecursive(dir: string, filename: string, maxDepth: number): string | null {
+  if (maxDepth <= 0) return null;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name.toLowerCase() === filename.toLowerCase()) {
+        return fullPath;
+      }
+      if (entry.isDirectory()) {
+        const found = findFileRecursive(fullPath, filename, maxDepth - 1);
+        if (found) return found;
+      }
+    }
+  } catch {
+    // permission errors, etc.
+  }
+  return null;
+}
+
+/** Kill a process cross-platform */
+function killProcess(proc: ChildProcess) {
+  if (!proc.pid) return;
+  if (process.platform === 'win32') {
+    try {
+      execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' });
+    } catch {
+      try { proc.kill(); } catch { /* already exited */ }
+    }
+  } else {
+    proc.kill('SIGINT');
+  }
+}
+
+/** Safe wrapper around a log WriteStream that prevents write-after-end crashes */
+function createSafeLogWriter(filePath: string) {
+  const stream = fs.createWriteStream(filePath, { flags: 'a' });
+  let ended = false;
+  return {
+    write(msg: string) {
+      if (!ended) {
+        try { stream.write(msg); } catch { /* ignore */ }
+      }
+    },
+    end() {
+      if (!ended) {
+        ended = true;
+        try { stream.end(); } catch { /* ignore */ }
+      }
+    },
+  };
+}
+
+export const streamManager = {
+  getStreams: () => Array.from(activeStreams.values()),
+
+  startStream: (name: string, inputUrl: string) => {
+    const id = Math.random().toString(36).substring(7);
+    const ffmpeg = getFfmpegPath();
+    const logFilePath = getLogFilePath();
+
+    const destinationUrl = `rtmp://74.208.198.159/live/${name.replace(/\s+/g, '_')}`;
+
+    const args = [
+      '-re',
+      '-i', inputUrl,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-tune', 'zerolatency',
+      '-c:a', 'aac',
+      '-f', 'flv',
+      destinationUrl
+    ];
+
+    console.log(`Starting ffmpeg for [${name}] → ${destinationUrl}`);
+
+    const log = createSafeLogWriter(logFilePath);
+    log.write(`\n--- Starting Stream: ${name} [${new Date().toISOString()}] ---\n`);
+    log.write(`Command: ${ffmpeg} ${args.join(' ')}\n`);
+
+    let ffmpegProcess: ChildProcess;
+    try {
+      ffmpegProcess = spawn(ffmpeg, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.write(`\n--- Stream [${name}] Spawn Error: ${errMsg} ---\n`);
+      log.end();
+      return {
+        id,
+        name,
+        inputUrl,
+        outputUrl: destinationUrl,
+        status: 'error' as const,
+        startTime: Date.now(),
+        logs: [`Error: ${errMsg}. Is ffmpeg installed and on PATH?`],
+      };
+    }
+
+    const stream: Stream = {
+      id,
+      name,
+      inputUrl,
+      outputUrl: destinationUrl,
+      status: 'streaming',
+      pid: ffmpegProcess.pid,
+      startTime: Date.now(),
+      logs: []
+    };
+
+    activeStreams.set(id, stream);
+    processes.set(id, ffmpegProcess);
+
+    ffmpegProcess.stdout?.on('data', (data) => {
+      const output = data.toString();
+      stream.logs.push(output);
+      log.write(output);
+      if (stream.logs.length > 50) stream.logs.shift();
+    });
+
+    ffmpegProcess.stderr?.on('data', (data) => {
+      const output = data.toString();
+      stream.logs.push(output);
+      log.write(output);
+      if (stream.logs.length > 50) stream.logs.shift();
+    });
+
+    ffmpegProcess.on('close', (code) => {
+      log.write(`\n--- Stream [${name}] stopped with code ${code} ---\n`);
+      log.end();
+      stream.status = code === 0 ? 'stopped' : 'error';
+      processes.delete(id);
+    });
+
+    ffmpegProcess.on('error', (err) => {
+      log.write(`\n--- Stream [${name}] Error: ${err.message} ---\n`);
+      log.end();
+      stream.status = 'error';
+      stream.logs.push(`Error: ${err.message}`);
+      processes.delete(id);
+    });
+
+    return stream;
+  },
+
+  stopStream: (id: string) => {
+    const proc = processes.get(id);
+    if (proc) {
+      killProcess(proc);
+      processes.delete(id);
+      const stream = activeStreams.get(id);
+      if (stream) {
+        stream.status = 'stopped';
+      }
+      return true;
+    }
+    return false;
+  },
+
+  removeStream: (id: string) => {
+    const proc = processes.get(id);
+    if (proc) {
+      killProcess(proc);
+      processes.delete(id);
+    }
+    activeStreams.delete(id);
+    return true;
+  },
+};
